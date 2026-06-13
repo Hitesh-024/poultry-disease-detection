@@ -1,0 +1,84 @@
+import pandas as pd
+
+
+def add_temporal_features(
+    df,
+    anomaly_threshold_quantile=0.10
+):
+    """
+    Add rolling statistics and anomaly persistence metrics
+    for each poultry pen over time.
+
+    Required columns:
+        - pen_id
+        - timestamp
+        - anomaly_score
+    """
+
+    df = df.copy()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    df = df.sort_values(
+        ["pen_id", "timestamp"]
+    )
+
+    def process_pen(group):
+        group = group.set_index("timestamp")
+
+        group["rolling_24h_mean"] = (
+            group["anomaly_score"]
+            .rolling("24h")
+            .mean()
+        )
+
+        group["rolling_7d_mean"] = (
+            group["anomaly_score"]
+            .rolling("7d")
+            .mean()
+        )
+
+        group["trend"] = (
+            group["rolling_24h_mean"]
+            .diff()
+        )
+
+        return group.reset_index()
+
+    df = (
+        df.groupby("pen_id", group_keys=False)
+        .apply(process_pen)
+    )
+
+    threshold = df["anomaly_score"].quantile(
+        anomaly_threshold_quantile
+    )
+
+    df["is_anomalous"] = (
+        df["anomaly_score"] < threshold
+    )
+
+    df["anomaly_streak"] = (
+        df.groupby("pen_id")["is_anomalous"]
+        .transform(
+            lambda x: x.groupby((~x).cumsum()).cumsum()
+        )
+    )
+
+    return df
+
+
+def classify_anomaly(
+    anomaly_streak,
+    trend
+):
+    if anomaly_streak >= 5:
+        return "Likely Disease"
+
+    if anomaly_streak < 3:
+        return "Transient Event"
+
+    if trend > 0:
+        return "Escalating"
+
+    return "Monitor"
