@@ -1,0 +1,312 @@
+import os
+import warnings
+
+import librosa
+import numpy as np
+import openpyxl
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+SAMPLE_RATE = 22050
+CLIP_DURATION = 5.0
+CONTAMINATION_RATE = 0.10
+
+LABEL_COLUMNS = [
+    "normal_chatter",
+    "distress_call",
+    "respiratory_flag",
+    "eating_drinking_movement",
+    "background_noise",
+    "silence",
+    "not_sure",
+    "bad_clip",
+]
+
+COLUMN_INDEX = {
+    name: idx
+    for idx, name in enumerate(LABEL_COLUMNS, start=7)
+}
+
+
+def extract_features(audio_path):
+    try:
+        y, sr = librosa.load(
+            audio_path,
+            sr=SAMPLE_RATE,
+            duration=CLIP_DURATION
+        )
+
+        if len(y) < sr * 0.5:
+            return None
+
+        mfcc = librosa.feature.mfcc(
+            y=y,
+            sr=sr,
+            n_mfcc=20
+        )
+
+        rms = librosa.feature.rms(y=y)[0]
+
+        zcr = librosa.feature.zero_crossing_rate(y=y)[0]
+
+        return np.concatenate([
+            np.mean(mfcc, axis=1),
+            np.std(mfcc, axis=1),
+            [
+                np.mean(rms),
+                np.std(rms),
+                np.max(rms),
+            ],
+            [
+                np.mean(zcr),
+            ],
+        ])
+
+    except Exception as error:
+        print(f"Failed to process {audio_path}: {error}")
+        return None
+
+
+def load_sheet(sheet_path):
+    workbook = openpyxl.load_workbook(
+        sheet_path,
+        read_only=True
+    )
+
+    worksheet = workbook["labels"]
+
+    annotations = {}
+
+    for row in worksheet.iter_rows(
+        min_row=2,
+        values_only=True
+    ):
+        filename = row[0]
+
+        if not filename:
+            continue
+
+        annotations[filename] = {
+            label: (
+                "yes"
+                if (
+                    COLUMN_INDEX[label] - 1 < len(row)
+                    and row[COLUMN_INDEX[label] - 1] == "yes"
+                )
+                else ""
+            )
+            for label in LABEL_COLUMNS
+        }
+
+    workbook.close()
+
+    return annotations
+
+
+def build_majority_vote_dataframe(annotation_files):
+    annotation_sets = [
+        load_sheet(path)
+        for path in annotation_files
+    ]
+
+    all_files = set()
+
+    for annotations in annotation_sets:
+        all_files.update(annotations.keys())
+
+    rows = []
+
+    for filename in all_files:
+        votes = [
+            dataset
+            for dataset in annotation_sets
+            if filename in dataset
+        ]
+
+        normal_votes = sum(
+            1 for vote in votes
+            if vote["normal_chatter"] == "yes"
+        )
+
+        distress_votes = sum(
+            1 for vote in votes
+            if vote["distress_call"] == "yes"
+        )
+
+        respiratory_votes = sum(
+            1 for vote in votes
+            if vote["respiratory_flag"] == "yes"
+        )
+
+        bad_votes = sum(
+            1 for vote in votes
+            if vote["bad_clip"] == "yes"
+        )
+
+        rows.append({
+            "filename": filename,
+            "normal_votes": normal_votes,
+            "distress_votes": distress_votes,
+            "respiratory_votes": respiratory_votes,
+            "bad_votes": bad_votes,
+            "is_flagged": (
+                distress_votes > 0
+                or respiratory_votes > 0
+            ),
+            "is_consensus": (
+                distress_votes >= 2
+                or respiratory_votes >= 2
+            ),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_feature_matrix(dataframe, clips_directory):
+    features = []
+    valid_files = []
+
+    print("Extracting audio features...")
+
+    for filename in dataframe["filename"]:
+        audio_path = os.path.join(
+            clips_directory,
+            filename
+        )
+
+        if not os.path.exists(audio_path):
+            continue
+
+        feature_vector = extract_features(
+            audio_path
+        )
+
+        if feature_vector is None:
+            continue
+
+        features.append(feature_vector)
+        valid_files.append(filename)
+
+    return np.array(features), valid_files
+
+
+def rank_anomalies(feature_matrix, valid_files, metadata):
+    normal_files = set(
+        metadata[
+            metadata["normal_votes"]
+            > metadata["distress_votes"]
+        ]["filename"]
+    )
+
+    scaler = StandardScaler()
+
+    feature_matrix = scaler.fit_transform(
+        feature_matrix
+    )
+
+    normal_mask = np.array([
+        filename in normal_files
+        for filename in valid_files
+    ])
+
+    model = IsolationForest(
+        contamination=CONTAMINATION_RATE,
+        random_state=42
+    )
+
+    model.fit(feature_matrix[normal_mask])
+
+    scores = model.decision_function(
+        feature_matrix
+    )
+
+    results = pd.DataFrame({
+        "filename": valid_files,
+        "anomaly_score": scores,
+    })
+
+    results = results.merge(
+        metadata,
+        on="filename"
+    )
+
+    return results.sort_values(
+        "anomaly_score"
+    )
+
+
+def main():
+    clips_directory = "data/audio"
+
+    annotation_files = [
+        "labels_Kritanshu_FINAL.xlsx",
+        "labels_Hitesh_FINAL.xlsx",
+        "labels_Shreyas_FINAL.xlsx",
+    ]
+
+    metadata = build_majority_vote_dataframe(
+        annotation_files
+    )
+
+    feature_matrix, valid_files = (
+        build_feature_matrix(
+            metadata,
+            clips_directory
+        )
+    )
+
+    print(
+        f"Extracted features from "
+        f"{len(valid_files)} clips"
+    )
+
+    results = rank_anomalies(
+        feature_matrix,
+        valid_files,
+        metadata
+    )
+
+    tier1 = results[
+        results["is_consensus"]
+    ]
+
+    tier2 = results[
+        results["is_flagged"]
+        & ~results["is_consensus"]
+    ]
+
+    tier3 = results[
+        ~results["is_flagged"]
+    ].head(20)
+
+    print("\n=== TIER 1 ===")
+    print(tier1[
+        ["filename", "anomaly_score"]
+    ])
+
+    print("\n=== TIER 2 ===")
+    print(tier2.head(20)[
+        ["filename", "anomaly_score"]
+    ])
+
+    print("\n=== TIER 3 ===")
+    print(tier3[
+        ["filename", "anomaly_score"]
+    ])
+
+    results.to_csv(
+        "vet_priority_list.csv",
+        index=False
+    )
+
+    print(
+        "\nSaved results to "
+        "vet_priority_list.csv"
+    )
+
+
+if __name__ == "__main__":
+    main()
