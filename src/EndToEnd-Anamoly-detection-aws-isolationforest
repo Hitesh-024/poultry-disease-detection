@@ -1,0 +1,505 @@
+"""
+Poultry Disease Early Detection — Audio ML Pipeline
+====================================================
+Converts raw 10-second WAV clips stored on AWS S3 into mel spectrograms,
+extracts acoustic features, and runs unsupervised anomaly detection to flag
+potential disease episodes for veterinary review.
+
+Pipeline stages:
+    1. List & filter unprocessed S3 keys (stateful, resumable)
+    2. WAV → mel spectrogram PNG (streamed, never touches disk)
+    3. 30-feature acoustic extraction per clip
+    4. IsolationForest + composite respiratory-flare scoring
+    5. Dynamic IQR threshold (no fixed contamination assumption)
+    6. Episode detection with duration-based classification
+    7. Structured CSV logs uploaded to S3
+"""
+
+import boto3
+import librosa
+import librosa.display
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
+import os
+import re
+import json
+from datetime import datetime
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from PIL import Image
+import warnings
+warnings.filterwarnings('ignore')
+
+# ── CONFIG ────────────────────────────────────────────────────────
+# All environment-specific values are read from env vars or a
+# config file — nothing hardcoded here.
+
+CONFIG = {
+    'source_bucket':        os.environ.get('SOURCE_BUCKET', ''),
+    'ml_bucket':            os.environ.get('ML_BUCKET', ''),
+    'pen_prefix':           os.environ.get('PEN_PREFIX', ''),
+    'pen_id':               os.environ.get('PEN_ID', ''),
+    'batch_size':           int(os.environ.get('BATCH_SIZE', 20000)),
+    'batch_number':         int(os.environ.get('BATCH_NUMBER', 1)),
+    'sample_rate':          22050,
+    'clip_duration':        10.0,
+    'n_mels':               128,
+    'img_size':             224,
+    'min_episode_hours':    4,
+    'region':               os.environ.get('AWS_REGION', 'ap-south-1'),
+}
+
+# ── AWS ───────────────────────────────────────────────────────────
+
+s3 = boto3.client('s3', region_name=CONFIG['region'])
+
+
+def upload_to_s3(local_path, s3_key):
+    s3.upload_file(local_path, CONFIG['ml_bucket'], s3_key)
+
+
+def upload_bytes_to_s3(data: bytes, s3_key: str, content_type='application/octet-stream'):
+    s3.put_object(Bucket=CONFIG['ml_bucket'], Key=s3_key,
+                  Body=data, ContentType=content_type)
+
+
+def upload_csv_to_s3(df, s3_key):
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    s3.put_object(Bucket=CONFIG['ml_bucket'], Key=s3_key,
+                  Body=buf.getvalue().encode('utf-8'), ContentType='text/csv')
+
+
+def load_audio_from_s3(bucket, key):
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    y, sr = librosa.load(
+        io.BytesIO(obj['Body'].read()),
+        sr=CONFIG['sample_rate'],
+        duration=CONFIG['clip_duration']
+    )
+    return y, sr
+
+
+def load_image_from_s3(bucket, key):
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    img = Image.open(io.BytesIO(obj['Body'].read())).convert('L')
+    return np.array(img, dtype=np.float32) / 255.0
+
+# ── STATE (resumable processing) ─────────────────────────────────
+
+STATE_KEY = f"state/{CONFIG['pen_id']}_state.json"
+
+
+def load_state():
+    try:
+        obj = s3.get_object(Bucket=CONFIG['ml_bucket'], Key=STATE_KEY)
+        return json.loads(obj['Body'].read())
+    except s3.exceptions.NoSuchKey:
+        return {
+            'pen_id':         CONFIG['pen_id'],
+            'processed_keys': [],
+            'episode_count':  0,
+            'last_run':       None,
+            'batches':        [],
+        }
+
+
+def save_state(state):
+    s3.put_object(
+        Bucket=CONFIG['ml_bucket'],
+        Key=STATE_KEY,
+        Body=json.dumps(state, indent=2, default=str)
+    )
+
+# ── FILE LISTING ──────────────────────────────────────────────────
+
+def list_wav_keys(bucket, prefix):
+    keys = []
+    paginator = s3.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            if obj['Key'].endswith('.wav'):
+                keys.append(obj['Key'])
+    return sorted(keys)
+
+
+def list_image_keys(bucket, prefix):
+    keys = []
+    paginator = s3.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            if obj['Key'] != prefix:
+                keys.append(obj['Key'])
+    return sorted(keys)
+
+# ── TIMESTAMP PARSING ─────────────────────────────────────────────
+
+def parse_timestamp(filename):
+    """
+    Extracts datetime from filenames of the form  <penID>-a<YYYYMMDD>_<HHMMSS>.ext
+    Returns pd.NaT on failure.
+    """
+    m = re.search(r'-a(\d{8}_\d{6})', filename)
+    if m:
+        try:
+            return pd.to_datetime(m.group(1), format='%Y%m%d_%H%M%S')
+        except ValueError:
+            pass
+    return pd.NaT
+
+
+def friendly(ts):
+    return ts.strftime('%d %b %Y  %H:%M:%S') if not pd.isnull(ts) else 'UNKNOWN'
+
+# ── STAGE 1: WAV → SPECTROGRAM ────────────────────────────────────
+
+def wav_to_spectrogram_bytes(y, sr):
+    """
+    Converts a waveform to a 224×224 mel-spectrogram PNG (in memory).
+    Log-scale (dB) representation surfaces cough/wheeze texture patterns
+    that are invisible in linear power spectrograms.
+    """
+    mel    = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=CONFIG['n_mels'])
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    sz     = CONFIG['img_size'] / 100
+    fig, ax = plt.subplots(figsize=(sz, sz))
+    ax.axis('off')
+    librosa.display.specshow(mel_db, ax=ax)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def run_spectrogram_stage(batch_keys, state):
+    print(f"Generating spectrograms for {len(batch_keys)} clips...")
+    processed, failed = [], []
+
+    for i, key in enumerate(batch_keys):
+        try:
+            y, sr = load_audio_from_s3(CONFIG['source_bucket'], key)
+            if len(y) < CONFIG['sample_rate']:          # skip sub-1s corrupted files
+                failed.append(key); continue
+
+            img_bytes = wav_to_spectrogram_bytes(y, sr)
+            fname     = key.split('/')[-1].replace('.wav', '.png')
+            s3_key    = f"spectrograms/{CONFIG['pen_id']}/{fname}"
+            upload_bytes_to_s3(img_bytes, s3_key, 'image/png')
+            processed.append(key)
+
+        except Exception as e:
+            print(f"  FAILED {key}: {e}")
+            failed.append(key)
+
+        if (i + 1) % 500 == 0:
+            print(f"  {i+1}/{len(batch_keys)}")
+
+    state['processed_keys'].extend(processed)
+    state['batches'].append({
+        'batch_number': CONFIG['batch_number'],
+        'processed':    len(processed),
+        'failed':       len(failed),
+        'timestamp':    datetime.utcnow().isoformat(),
+    })
+    state['last_run'] = datetime.utcnow().isoformat()
+    save_state(state)
+    print(f"Spectrograms done — {len(processed)} ok, {len(failed)} failed")
+    return processed
+
+# ── STAGE 2: IMAGE FEATURE EXTRACTION ────────────────────────────
+
+def extract_image_features(key, arr):
+    """
+    Extracts 30 features from a grayscale mel-spectrogram image.
+
+    Frequency band layout (standard mel, top-row = high freq):
+        high band  →  top 33% rows   (5 kHz+)
+        mid  band  →  middle 34%     (2–5 kHz)
+        low  band  →  bottom 33%     (0–2 kHz)
+
+    Respiratory flare proxies:
+        high_to_low   — energy ratio; elevated during coughing/wheezing
+        burst_score   — peak amplitude × temporal variance; spikes on cough events
+        col_peak_r    — max vs mean column energy; detects sudden bursts
+        centroid_norm — spectral center of mass; shifts upward in distress
+    """
+    H, W   = arr.shape
+    lo_cut = int(H * 0.33); mid_cut = int(H * 0.67)
+    low_b  = arr[H - lo_cut:, :]
+    mid_b  = arr[H - mid_cut: H - lo_cut, :]
+    high_b = arr[:H - mid_cut, :]
+
+    def stats(b):
+        return [float(np.mean(b)), float(np.std(b)),
+                float(np.percentile(b, 90)), float(np.max(b))]
+
+    ls, ms, hs = stats(low_b), stats(mid_b), stats(high_b)
+
+    g_mean  = float(np.mean(arr)); g_std = float(np.std(arr))
+    g_max   = float(np.max(arr));  g_p90 = float(np.percentile(arr, 90))
+    g_p10   = float(np.percentile(arr, 10))
+    dyn_rng = g_max - float(np.min(arr))
+
+    low_tv  = float(np.mean(np.std(low_b,  axis=1)))
+    mid_tv  = float(np.mean(np.std(mid_b,  axis=1)))
+    high_tv = float(np.mean(np.std(high_b, axis=1)))
+
+    h2l     = (hs[0] + 1e-9) / (ls[0] + 1e-9)
+    h2m     = (hs[0] + 1e-9) / (ms[0] + 1e-9)
+    burst   = hs[3] * high_tv
+    e_shift = hs[0] - ls[0]
+
+    col_e   = np.mean(arr, axis=0)
+    c_mean  = float(np.mean(col_e)); c_std = float(np.std(col_e))
+    c_peak  = float(np.max(col_e) / (c_mean + 1e-9))
+    c_p95   = float(np.percentile(col_e, 95))
+
+    row_w   = np.mean(arr, axis=1)
+    cent_r  = float(np.sum(np.arange(H) * row_w) / (np.sum(row_w) + 1e-9))
+    cent_n  = float((H - cent_r) / H)
+
+    fv = np.array([
+        *ls, *ms, *hs,
+        g_mean, g_std, g_max, g_p90, g_p10, dyn_rng,
+        low_tv, mid_tv, high_tv,
+        h2l, h2m, burst, e_shift,
+        c_mean, c_std, c_peak, c_p95,
+        cent_r, cent_n,
+    ], dtype=np.float32)
+
+    return {
+        'key':        key,
+        'filename':   key.split('/')[-1],
+        'pen_id':     CONFIG['pen_id'],
+        'timestamp':  parse_timestamp(key.split('/')[-1]),
+        'features':   fv,
+        'h2l':        h2l,
+        'burst':      burst,
+        'e_shift':    e_shift,
+        'col_peak':   c_peak,
+        'cent_n':     cent_n,
+        'high_tv':    high_tv,
+        'g_mean':     g_mean,
+        'g_std':      g_std,
+    }
+
+
+def run_feature_stage(image_keys):
+    print(f"Extracting features from {len(image_keys)} spectrograms...")
+    records, failed = [], []
+
+    for i, key in enumerate(image_keys):
+        try:
+            arr = load_image_from_s3(CONFIG['ml_bucket'], key)
+            records.append(extract_image_features(key, arr))
+        except Exception as e:
+            failed.append({'key': key, 'error': str(e)})
+        if (i + 1) % 1000 == 0:
+            print(f"  {i+1}/{len(image_keys)}  failed={len(failed)}")
+
+    df = pd.DataFrame(records)
+    ok = df['timestamp'].notna().sum()
+    df = (df.sort_values('timestamp') if ok > len(df) * 0.8
+          else df.sort_values('filename')).reset_index(drop=True)
+    print(f"Features done — {len(records)} ok, {len(failed)} failed")
+    return df, failed
+
+# ── STAGE 3: ANOMALY SCORING ──────────────────────────────────────
+
+def zscore(a):
+    return (a - a.mean()) / (a.std() + 1e-9)
+
+
+def run_anomaly_stage(df, sensitivity=2.0):
+    """
+    Composite anomaly score = weighted blend of IsolationForest output
+    and domain-specific respiratory flare signals.
+    Dynamic IQR threshold avoids the fixed-contamination assumption:
+    in a healthy cohort very few clips are flagged; in a sick cohort many are.
+    """
+    X     = np.vstack(df['features'].values)
+    X_sc  = StandardScaler().fit_transform(X)
+    iso   = IsolationForest(n_estimators=300, contamination=0.10,
+                            random_state=42, n_jobs=-1)
+    iso.fit(X_sc)
+    iso_s = iso.decision_function(X_sc)
+
+    comp = (
+        0.40 * zscore(iso_s)
+      + 0.20 * zscore(-df['h2l'].values)
+      + 0.20 * zscore(-df['burst'].values)
+      + 0.10 * zscore(-df['cent_n'].values)
+      + 0.10 * zscore(-df['col_peak'].values)
+    )
+
+    Q1, Q3 = np.percentile(comp, 25), np.percentile(comp, 75)
+    IQR    = Q3 - Q1
+    thresh = Q1 - sensitivity * IQR
+    is_anom = comp < thresh
+
+    print(f"Composite score  mean={comp.mean():.4f}  std={comp.std():.4f}")
+    print(f"IQR threshold    Q1={Q1:.4f}  IQR={IQR:.4f}  cutoff={thresh:.4f}")
+    print(f"Flagged          {is_anom.sum()} / {len(df)} ({100*is_anom.mean():.2f}%)")
+
+    df['iso_score']    = iso_s
+    df['comp_score']   = comp
+    df['is_anomalous'] = is_anom
+    return df, thresh
+
+# ── STAGE 4: EPISODE DETECTION ────────────────────────────────────
+
+CLIP_SEC = int(CONFIG['clip_duration'])
+
+
+def detect_episodes(df, min_clips=10):
+    """
+    Groups temporally consecutive anomalous clips (gap < 5 min) into episodes.
+
+    Classification by duration:
+        < 4 hrs   → TRANSIENT        (mic artifact / brief stress)
+        4–72 hrs  → POSSIBLE_DISEASE (could be vaccination reaction)
+        > 72 hrs  → LIKELY_DISEASE   (vaccination resolves < 72 h by biology)
+    """
+    df = df.copy().sort_values('timestamp').reset_index(drop=True)
+
+    if df['timestamp'].isna().all():
+        df['_t'] = (pd.to_datetime('2024-01-01')
+                    + pd.to_timedelta(df.index * CLIP_SEC, unit='s'))
+    else:
+        df['_t'] = df['timestamp']
+
+    df['streak'] = (df['is_anomalous'] != df['is_anomalous'].shift()).cumsum()
+    rows = []
+
+    for sid, grp in df[df['is_anomalous']].groupby('streak'):
+        grp = grp.sort_values('_t')
+        cc  = len(grp)
+        if cc < min_clips:
+            continue
+
+        t0      = grp['_t'].iloc[0]
+        t1      = grp['_t'].iloc[-1]
+        dur_sec = (t1 - t0).total_seconds() + CLIP_SEC
+        dur_hrs = dur_sec / 3600
+
+        etype = ('TRANSIENT' if dur_hrs < 4 else
+                 'POSSIBLE_DISEASE' if dur_hrs <= 72 else
+                 'LIKELY_DISEASE')
+
+        rows.append({
+            'episode_id':              len(rows) + 1,
+            'pen_id':                  CONFIG['pen_id'],
+            'batch_id':                f"batch_{CONFIG['batch_number']:03d}",
+            'episode_type':            etype,
+            'needs_vet_review':        etype == 'LIKELY_DISEASE',
+            'date':                    t0.strftime('%d %b %Y'),
+            'start_datetime':          friendly(t0),
+            'end_datetime':            friendly(t1),
+            'start_ts_iso':            t0.isoformat(),
+            'end_ts_iso':              t1.isoformat(),
+            'duration_hrs':            round(dur_hrs, 3),
+            'duration_min':            round(dur_sec / 60, 1),
+            'clip_count':              cc,
+            'total_audio_sec':         cc * CLIP_SEC,
+            'first_filename':          grp['filename'].iloc[0],
+            'last_filename':           grp['filename'].iloc[-1],
+            'comp_score_mean':         round(grp['comp_score'].mean(), 4),
+            'comp_score_min':          round(grp['comp_score'].min(), 4),
+            'iso_score_mean':          round(grp['iso_score'].mean(), 4),
+            'h2l_mean':                round(grp['h2l'].mean(), 4),
+            'h2l_max':                 round(grp['h2l'].max(), 4),
+            'burst_mean':              round(grp['burst'].mean(), 4),
+            'burst_max':               round(grp['burst'].max(), 4),
+            'centroid_mean':           round(grp['cent_n'].mean(), 4),
+            'high_tv_mean':            round(grp['high_tv'].mean(), 4),
+            'top5_clips':              json.dumps(
+                grp.nsmallest(5, 'comp_score')['filename'].tolist()),
+            'log_generated_at_utc':    datetime.utcnow().strftime('%d %b %Y  %H:%M:%S UTC'),
+        })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+# ── STAGE 5: LOGGING ──────────────────────────────────────────────
+
+def run_logging_stage(episode_df, score_df, failed):
+    ts  = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    pen = CONFIG['pen_id']
+    b   = f"batch_{CONFIG['batch_number']:03d}"
+    pfx = f"logs/{pen}/"
+
+    score_cols = ['key', 'filename', 'pen_id', 'timestamp',
+                  'iso_score', 'comp_score', 'is_anomalous',
+                  'h2l', 'burst', 'e_shift', 'col_peak',
+                  'cent_n', 'high_tv', 'g_mean', 'g_std']
+
+    upload_csv_to_s3(score_df[score_cols], f"{pfx}{pen}_{b}_clip_scores_{ts}.csv")
+
+    if len(episode_df):
+        upload_csv_to_s3(episode_df, f"{pfx}{pen}_{b}_episodes_{ts}.csv")
+
+    if failed:
+        upload_csv_to_s3(pd.DataFrame(failed), f"{pfx}{pen}_{b}_failures_{ts}.csv")
+
+    print(f"Logs uploaded to s3://{CONFIG['ml_bucket']}/{pfx}")
+
+# ── MAIN ──────────────────────────────────────────────────────────
+
+def main():
+    state = load_state()
+
+    # ── 1. Spectrogram generation (WAV → PNG) ─────────────────────
+    all_wav = list_wav_keys(CONFIG['source_bucket'], CONFIG['pen_prefix'])
+    todo    = [k for k in all_wav if k not in set(state['processed_keys'])]
+    batch   = todo[:CONFIG['batch_size']]
+    print(f"WAV files total={len(all_wav)}  unprocessed={len(todo)}  this batch={len(batch)}")
+    run_spectrogram_stage(batch, state)
+
+    # ── 2. Feature extraction (PNG → feature vectors) ─────────────
+    img_prefix  = f"spectrograms/{CONFIG['pen_id']}/"
+    all_img     = list_image_keys(CONFIG['ml_bucket'], img_prefix)
+    # skip first 20 (index calibration artifacts); slice this batch
+    start_idx   = int(os.environ.get('IMG_START_IDX', 20))
+    end_idx     = start_idx + CONFIG['batch_size']
+    target_imgs = all_img[start_idx:end_idx]
+    print(f"Images: {len(all_img)} total  processing [{start_idx}:{end_idx}]")
+
+    df, failed = run_feature_stage(target_imgs)
+
+    # ── 3. Anomaly scoring ────────────────────────────────────────
+    sensitivity = float(os.environ.get('IQR_SENSITIVITY', 2.0))
+    df, thresh  = run_anomaly_stage(df, sensitivity=sensitivity)
+
+    # ── 4. Episode detection ──────────────────────────────────────
+    min_clips   = int(os.environ.get('MIN_EPISODE_CLIPS', 10))
+    episode_df  = detect_episodes(df, min_clips=min_clips)
+
+    print(f"\n{'='*55}")
+    print(f"EPISODE SUMMARY  |  Pen: {CONFIG['pen_id']}")
+    print(f"{'='*55}")
+    print(f"Total episodes: {len(episode_df)}")
+    if len(episode_df):
+        for _, r in episode_df.iterrows():
+            flag = "  *** VET REVIEW ***" if r['needs_vet_review'] else ""
+            print(f"\n  Episode {r['episode_id']:02d}  [{r['episode_type']}]{flag}")
+            print(f"    {r['date']}  {r['start_datetime'].split()[2]}–{r['end_datetime'].split()[2]}")
+            print(f"    Duration : {r['duration_hrs']} hrs  ({r['clip_count']} clips)")
+            print(f"    Files    : {r['first_filename']}  →  {r['last_filename']}")
+            print(f"    Score    : mean={r['comp_score_mean']}  min={r['comp_score_min']}")
+            print(f"    H/L ratio: {r['h2l_mean']}  burst={r['burst_max']}")
+
+    # ── 5. Upload logs ────────────────────────────────────────────
+    run_logging_stage(episode_df, df, failed)
+
+    state['episode_count'] += len(episode_df)
+    state['last_run'] = datetime.utcnow().isoformat()
+    save_state(state)
+    print("\nDone.")
+
+
+if __name__ == '__main__':
+    main()
