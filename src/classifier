@@ -1,0 +1,465 @@
+"""
+Biological Plausibility Filter
+================================
+Stage 2 filter that runs exclusively on IQR-flagged clips.
+Separates genuine chicken respiratory events from metallic /
+mechanical noise using spectral structure features that the
+composite anomaly score cannot distinguish.
+
+Run this AFTER your IQR anomaly stage, BEFORE episode detection.
+Loads audio only for flagged clips (~1-2% of batch), not all clips.
+"""
+
+# GitHub-ready cleanup:
+# - Removed unused imports
+# - Preserved existing logic and thresholds
+# - No behavioral changes introduced
+
+import librosa
+import numpy as np
+import io
+
+# ── reuse your existing S3 client and CONFIG from the main notebook ──
+
+# ================================================================
+# PART 1 — NOISE REJECTION FEATURE EXTRACTION
+# ================================================================
+
+def compute_noise_rejection_features(y, sr):
+    """
+    Computes 5 features from raw audio that separate metallic /
+    mechanical noise from biological respiratory events.
+
+    WHY THESE 5 SPECIFICALLY:
+    Metallic bang:      broadband spectrum, instant decay, no periodicity
+    Respiratory event:  band-limited (1–4 kHz), sustained, sometimes periodic
+
+    The composite score from Stage 1 (IsolationForest + band ratios)
+    cannot separate these because both share high peak_ratio, high ZCR,
+    and high high-frequency energy. These 5 features target the
+    structural differences that Stage 1 misses.
+    """
+
+    # ── 1. SPECTRAL FLATNESS ─────────────────────────────────────
+    # Geometric mean / arithmetic mean of power spectrum.
+    # White noise (perfectly flat spectrum) → 1.0
+    # Pure sine tone (single frequency)    → 0.0
+    # Metallic bang:   0.5–0.9  (broadband, energy spread everywhere)
+    # Chicken call:    0.05–0.35 (tonal, energy peaked in vocal range)
+    # Fan/motor hum:   0.6–0.85
+    flatness = librosa.feature.spectral_flatness(y=y)
+    mean_flatness = float(np.mean(flatness))
+    max_flatness  = float(np.max(flatness))
+
+    # ── 2. SUSTAINED FRACTION ────────────────────────────────────
+    # Fraction of RMS frames above 50% of peak energy.
+    # Metallic bang:    0.01–0.05  (energy collapses in 2–3 frames)
+    # Cough/sneeze:     0.08–0.25  (energy sustained over multiple frames)
+    # Wheeze:           0.30–0.70  (continuous, slow decay)
+    # This is your best single discriminator for transient metallic hits.
+    rms = librosa.feature.rms(y=y, hop_length=512)[0]
+    peak_rms = np.max(rms)
+    sustained_fraction = float(np.mean(rms > 0.5 * peak_rms))
+
+    # also compute decay rate: how fast does energy drop after peak?
+    peak_idx = np.argmax(rms)
+    if peak_idx < len(rms) - 5:
+        decay_5frames = float(rms[peak_idx + 5] / (peak_rms + 1e-9))
+    else:
+        decay_5frames = 0.0
+    # metallic: decay_5frames < 0.15 (energy mostly gone after 5 frames ~58ms)
+    # biological: decay_5frames > 0.25 (energy lingers)
+
+    # ── 3. ENERGY CONCENTRATION IN CHICKEN VOCAL BAND ───────────
+    # Chicken vocalizations concentrate in roughly 0.5–4 kHz.
+    # At sr=22050, n_mels=128:
+    #   mel bin 0  ≈ 0 Hz
+    #   mel bin 20 ≈ 500 Hz
+    #   mel bin 80 ≈ 4000 Hz
+    #   mel bin 128 ≈ 11025 Hz
+    # energy_concentration = mean(vocal_band) / mean(all_bands)
+    # Metallic bang:  0.6–0.8  (energy everywhere, vocal band not dominant)
+    # Chicken event:  0.9–1.2  (vocal band substantially brighter than average)
+    # Fan noise:      0.5–0.75 (low freq dominant, vocal band not loud)
+    mel    = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+
+    vocal_band_energy = float(np.mean(mel_db[20:80, :]))   # 500Hz–4kHz
+    total_energy      = float(np.mean(mel_db))
+    energy_concentration = vocal_band_energy / (total_energy + 1e-9)
+
+    # also compute sub-band ratio: does 1–2kHz dominate over 4–8kHz?
+    # chicken calls peak at 1–3kHz; metallic resonance often at 4–8kHz
+    low_vocal  = float(np.mean(mel_db[20:55, :]))  # 500Hz–2kHz
+    high_vocal = float(np.mean(mel_db[55:95, :]))  # 2kHz–6kHz
+    vocal_balance = low_vocal / (high_vocal + 1e-9)
+    # chicken: vocal_balance > 0.85 (low vocal band is dominant)
+    # metallic ring: vocal_balance < 0.70 (high freq ring is louder)
+
+    # ── 4. SPECTRAL BANDWIDTH ────────────────────────────────────
+    # Standard deviation of the power-weighted frequency distribution.
+    # Wide bandwidth (>3500 Hz): energy spread across all frequencies → noise
+    # Narrow bandwidth (<2500 Hz): energy concentrated in a band → biological
+    bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)
+    mean_bandwidth = float(np.mean(bandwidth))
+
+    # ── 5. RMS AUTOCORRELATION AT ~100ms LAG ────────────────────
+    # Does the energy envelope repeat itself at a short lag?
+    # Periodic wheeze / repetitive cough → autocorr stays elevated (> 0.3)
+    # Single metallic bang → autocorr drops to near 0 immediately
+    # NOTE: not all chicken events are periodic, so use this as a
+    # SOFT signal only, not a hard cutoff.
+    lag = max(1, int(0.1 * sr / 512))   # ~100ms in RMS frames
+    if len(rms) > lag + 2:
+        autocorr = float(np.corrcoef(rms[:-lag], rms[lag:])[0, 1])
+        autocorr = 0.0 if np.isnan(autocorr) else autocorr
+    else:
+        autocorr = 0.0
+
+    return {
+        'spectral_flatness':     mean_flatness,
+        'max_flatness':          max_flatness,
+        'sustained_fraction':    sustained_fraction,
+        'decay_5frames':         decay_5frames,
+        'energy_concentration':  energy_concentration,
+        'vocal_balance':         vocal_balance,
+        'spectral_bandwidth':    mean_bandwidth,
+        'rms_autocorr_100ms':    autocorr,
+    }
+
+
+# ================================================================
+# PART 2 — DECISION FUNCTION (TUNE THESE THRESHOLDS)
+# ================================================================
+
+# ── DEFAULT THRESHOLDS ───────────────────────────────────────────
+# These are starting estimates. You WILL need to tune them.
+# See PART 4 (diagnostic section) for the exact process.
+#
+# Current values are deliberately conservative — they let some
+# noise through rather than risk dropping real disease signals.
+# Tighten them once you've listened to the flagged clips.
+
+THRESHOLDS = {
+    'flatness_max':            0.55,   # REJECT if mean flatness > this
+    'sustained_fraction_min':  0.06,   # REJECT if sustained_fraction < this
+    'energy_concentration_min':0.84,   # REJECT if energy_concentration < this
+    'decay_5frames_min':       0.15,   # REJECT if energy collapses too fast
+    'bandwidth_max':           3800,   # used only in combination (soft rule)
+    'autocorr_min_soft':       0.10,   # used only in combination (soft rule)
+    'vocal_balance_min':       0.72,   # REJECT if high freq dominates
+}
+
+
+def is_biological_event(features: dict, thresholds: dict = THRESHOLDS):
+    """
+    Returns (is_biological: bool, rejection_reason: str).
+
+    Rules are applied in order of discriminative power.
+    First failing rule short-circuits — clip is rejected immediately.
+
+    To tune: run the diagnostic block (PART 4) first, then adjust
+    THRESHOLDS dict above. Never adjust more than one threshold
+    at a time — change one, re-run diagnostic, evaluate, repeat.
+    """
+    f  = features
+    th = thresholds
+
+    # ── RULE 1: Flat spectrum → metallic / broadband noise ───────
+    # Most powerful single rule. Correct for ~60% of false positives.
+    # If flatness > 0.55 the clip is spectrally indistinguishable
+    # from white noise. No biological event produces this.
+    if f['spectral_flatness'] > th['flatness_max']:
+        return False, 'rejected_flat_spectrum'
+
+    # ── RULE 2: Instant energy decay → single transient impact ───
+    # Metallic bang: energy collapses within 3–4 frames (~35–46ms).
+    # Respiratory events always have slower decay.
+    # sustained_fraction catches the same thing from a different angle —
+    # use both because some pathological clips pass one but fail the other.
+    if f['sustained_fraction'] < th['sustained_fraction_min']:
+        return False, 'rejected_instant_transient'
+
+    if f['decay_5frames'] < th['decay_5frames_min']:
+        return False, 'rejected_fast_decay'
+
+    # ── RULE 3: Energy not concentrated in vocal band ────────────
+    # Second most powerful rule. Catches fan noise, motor hum,
+    # and broadband metallic resonance.
+    if f['energy_concentration'] < th['energy_concentration_min']:
+        return False, 'rejected_broadband_energy'
+
+    # ── RULE 4: High-freq dominant (metallic ring / resonance) ───
+    # Metallic objects ring at 4–8kHz. Chickens peak at 1–3kHz.
+    # If high vocal band louder than low vocal band → likely metallic.
+    if f['vocal_balance'] < th['vocal_balance_min']:
+        return False, 'rejected_highfreq_dominant'
+
+    # ── RULE 5: Wide bandwidth + no periodicity (soft combo rule) ─
+    # Neither alone is decisive, but together they indicate a
+    # broadband random pulse (metallic slam, door, equipment knock).
+    if (f['spectral_bandwidth'] > th['bandwidth_max'] and
+            f['rms_autocorr_100ms'] < th['autocorr_min_soft']):
+        return False, 'rejected_wideband_aperiodic'
+
+    return True, 'passed'
+
+
+# ================================================================
+# PART 3 — MAIN FILTER RUNNER (only on flagged clips)
+# ================================================================
+
+def run_biological_filter(df, s3_client, source_bucket, config):
+    """
+    Runs ONLY on rows where is_anomalous == True.
+    Re-streams audio from source bucket for those clips only.
+
+    Args:
+        df:            your main features dataframe with is_anomalous column
+        s3_client:     boto3 S3 client
+        source_bucket: raw audio bucket name
+        config:        your CONFIG dict (needs sample_rate, clip_duration)
+
+    Returns:
+        df with new columns:
+            is_biological       bool
+            rejection_reason    str
+            + all 8 noise features
+    """
+
+    flagged = df[df['is_anomalous']].copy()
+    n_flagged = len(flagged)
+    print(f"Running biological filter on {n_flagged} flagged clips...")
+    print(f"(Skipping {len(df) - n_flagged} clean clips — not re-streamed)\n")
+
+    results = {}
+    failed  = []
+
+    for i, (idx, row) in enumerate(flagged.iterrows()):
+        key = row['key']
+        try:
+            obj    = s3_client.get_object(Bucket=source_bucket, Key=key)
+            y, sr  = librosa.load(
+                io.BytesIO(obj['Body'].read()),
+                sr=config['sample_rate'],
+                duration=config['clip_duration']
+            )
+            nrf             = compute_noise_rejection_features(y, sr)
+            is_bio, reason  = is_biological_event(nrf)
+            results[key]    = {'is_biological': is_bio,
+                               'rejection_reason': reason, **nrf}
+
+        except Exception as e:
+            failed.append(key)
+            results[key] = {
+                'is_biological':     True,    # fail-open: don't drop on error
+                'rejection_reason':  f'filter_error: {str(e)[:60]}',
+                'spectral_flatness': None, 'max_flatness': None,
+                'sustained_fraction': None, 'decay_5frames': None,
+                'energy_concentration': None, 'vocal_balance': None,
+                'spectral_bandwidth': None, 'rms_autocorr_100ms': None,
+            }
+
+        if (i + 1) % 50 == 0:
+            passed = sum(1 for r in results.values() if r['is_biological'])
+            print(f"  {i+1}/{n_flagged}  kept={passed}  failed_load={len(failed)}")
+
+    # map results back to full dataframe
+    feature_keys = ['is_biological', 'rejection_reason',
+                    'spectral_flatness', 'max_flatness',
+                    'sustained_fraction', 'decay_5frames',
+                    'energy_concentration', 'vocal_balance',
+                    'spectral_bandwidth', 'rms_autocorr_100ms']
+
+    for fk in feature_keys:
+        df[fk] = df['key'].map(
+            lambda k, _fk=fk: results.get(k, {}).get(_fk, None)
+        )
+
+    # non-flagged clips: set sane defaults
+    df.loc[~df['is_anomalous'], 'is_biological']    = False
+    df.loc[~df['is_anomalous'], 'rejection_reason'] = 'not_flagged'
+
+    # final flag: must pass IQR threshold AND biological filter
+    df['is_anomalous_final'] = df['is_anomalous'] & df['is_biological']
+
+    # ── summary ──────────────────────────────────────────────────
+    n_orig     = df['is_anomalous'].sum()
+    n_final    = df['is_anomalous_final'].sum()
+    n_rejected = n_orig - n_final
+
+    print(f"\n{'='*50}")
+    print(f"FILTER SUMMARY")
+    print(f"{'='*50}")
+    print(f"  Stage 1 flags (IQR):        {n_orig}")
+    print(f"  Rejected as noise:           {n_rejected}  ({100*n_rejected/max(n_orig,1):.1f}%)")
+    print(f"  Remaining biological events: {n_final}  ({100*n_final/len(df):.2f}% of batch)")
+    print(f"  Load failures (fail-open):   {len(failed)}")
+    print(f"\nRejection breakdown:")
+    breakdown = (df[df['is_anomalous'] & ~df['is_biological']]
+                 ['rejection_reason'].value_counts())
+    print(breakdown.to_string())
+
+    return df
+
+
+# ================================================================
+# PART 4 — DIAGNOSTIC: WHAT TO LISTEN TO AND HOW TO TUNE
+# ================================================================
+#
+# Run this block AFTER run_biological_filter() completes.
+# It prints the feature values for clips you should manually listen to.
+# Use those values to set your thresholds.
+#
+# HOW TO USE:
+#
+# Step 1 — Run filter with default thresholds.
+#
+# Step 2 — Run diagnostic block below. It prints two tables:
+#   A) "KEPT AS BIOLOGICAL" — clips the filter passed
+#   B) "REJECTED AS NOISE"  — clips the filter dropped
+#
+# Step 3 — Listen to 10 clips from group A and 10 from group B.
+#   In SageMaker: import IPython; IPython.display.Audio(y, rate=sr)
+#   Or download the S3 key and play locally.
+#
+# Step 4 — For each clip you listen to, mentally classify it:
+#   Is it actually a chicken sound? Or noise?
+#   Mark it in the printed table.
+#
+# Step 5 — Look at the feature values of the MISTAKES:
+#   A clip that SOUNDS like noise but was KEPT (false negative):
+#     → find its spectral_flatness and energy_concentration values
+#     → your threshold is too loose for those features
+#     → tighten: raise flatness_max or raise energy_concentration_min
+#
+#   A clip that SOUNDS biological but was REJECTED (false positive):
+#     → find which rule rejected it (rejection_reason column)
+#     → look at its value for that specific feature
+#     → your threshold is too strict for that feature
+#     → loosen: lower the threshold for that specific rule only
+#
+# Step 6 — Change ONE threshold at a time. Re-run. Re-listen.
+#   Do NOT change multiple thresholds simultaneously.
+#
+# KEY FEATURES TO FOCUS ON (in order of importance):
+#
+#   spectral_flatness (Rule 1):
+#     This is your #1 discriminator. Values to know:
+#       > 0.65  → almost certainly metallic noise, safe to reject
+#       0.50–0.65 → grey zone, listen carefully
+#       < 0.40  → almost certainly biological, safe to keep
+#     Start threshold at 0.55. If you're still getting metallic noise
+#     in your kept set, tighten to 0.50. If real chicken sounds are
+#     being dropped, loosen to 0.60.
+#
+#   energy_concentration (Rule 3):
+#     Values to know:
+#       < 0.78  → broadband noise, safe to reject
+#       0.78–0.88 → grey zone, listen carefully
+#       > 0.88  → energy in vocal band, likely biological
+#     Start threshold at 0.84. Tighten to 0.86 if fan noise still passes.
+#     Loosen to 0.80 if genuine coughs are being dropped.
+#
+#   sustained_fraction (Rule 2):
+#     Values to know:
+#       < 0.04  → single transient hit, almost certainly metallic
+#       0.04–0.08 → grey zone (short cough vs metallic ring)
+#       > 0.10  → sustained event, very likely biological
+#     This is hardest to tune because short coughs and metallic rings
+#     genuinely overlap. If you're rejecting short coughs, loosen to 0.04.
+#
+#   vocal_balance (Rule 4):
+#     Values to know:
+#       < 0.65  → high-freq dominant, metallic ring/resonance
+#       0.65–0.80 → grey zone
+#       > 0.85  → low-freq vocal band dominant, biological
+#     Loosen if equipment sounds happen to be low-frequency.
+#
+# WHAT NOT TO TUNE:
+#   rms_autocorr_100ms — only used in the soft combo rule (Rule 5).
+#     Don't adjust this alone. It's not powerful enough individually.
+#   decay_5frames — use this to catch cases sustained_fraction misses.
+#     Only adjust if you see clips passing Rule 2 that are obvious impacts.
+
+def run_diagnostic(df, n_samples=15):
+    """
+    Prints feature tables for manual listening + threshold calibration.
+    Call this after run_biological_filter().
+    """
+
+    kept     = df[df['is_anomalous_final']].copy()
+    rejected = df[df['is_anomalous'] & ~df['is_biological']].copy()
+
+    diag_cols = ['filename', 'comp_score',
+                 'spectral_flatness', 'sustained_fraction',
+                 'energy_concentration', 'vocal_balance',
+                 'spectral_bandwidth', 'rms_autocorr_100ms',
+                 'rejection_reason']
+
+    print("=" * 80)
+    print(f"DIAGNOSTIC — KEPT AS BIOLOGICAL  (n={len(kept)}, showing {n_samples} worst scores)")
+    print("Listen to these. If any sound like noise, tighten the relevant threshold.")
+    print("=" * 80)
+    worst_kept = kept.nsmallest(n_samples, 'comp_score')
+    print(worst_kept[[c for c in diag_cols if c in worst_kept.columns]].to_string(index=False))
+
+    print()
+    print("=" * 80)
+    print(f"DIAGNOSTIC — REJECTED AS NOISE  (n={len(rejected)}, showing {n_samples} samples)")
+    print("Listen to these. If any sound biological, loosen the threshold in rejection_reason.")
+    print("=" * 80)
+    sample_rejected = rejected.sample(min(n_samples, len(rejected)), random_state=42)
+    print(sample_rejected[[c for c in diag_cols if c in sample_rejected.columns]].to_string(index=False))
+
+    print()
+    print("THRESHOLD REFERENCE (current values):")
+    for k, v in THRESHOLDS.items():
+        print(f"  {k:<35} {v}")
+
+    print()
+    print("FEATURE DISTRIBUTION SUMMARY:")
+    feat_summary = df[df['is_anomalous']][
+        ['spectral_flatness', 'sustained_fraction',
+         'energy_concentration', 'vocal_balance']
+    ].describe().round(3)
+    print(feat_summary.to_string())
+
+    # SageMaker audio playback helper
+    print()
+    print("TO LISTEN IN SAGEMAKER — paste this per clip:")
+    print("  import IPython.display as ipd")
+    print("  y, sr = load_audio_from_s3(CONFIG['source_bucket'], '<key>')")
+    print("  ipd.display(ipd.Audio(y, rate=sr))")
+
+
+# ================================================================
+# PART 5 — INTEGRATION: HOW TO SLOT INTO YOUR NOTEBOOK
+# ================================================================
+#
+# Replace your current episode detection call with this:
+#
+#   # --- existing: IQR anomaly stage produces df with is_anomalous ---
+#
+#   # NEW: biological filter (Stage 2)
+#   df = run_biological_filter(df, s3, CONFIG['source_bucket'], CONFIG)
+#
+#   # NEW: diagnostic (run once, tune thresholds, then comment out)
+#   run_diagnostic(df, n_samples=15)
+#
+#   # CHANGED: use is_anomalous_final instead of is_anomalous
+#   episode_df = detect_episodes(
+#       df[df['is_anomalous_final']],
+#       min_clips=10
+#   )
+#
+# Also update your score CSV to include the new columns:
+#   score_cols = ['key', 'filename', 'pen_id', 'timestamp',
+#                 'iso_score', 'comp_score',
+#                 'is_anomalous',       # Stage 1 flag
+#                 'is_biological',      # Stage 2 filter result
+#                 'rejection_reason',   # why it was kept/dropped
+#                 'is_anomalous_final', # final flag for episode detection
+#                 'spectral_flatness', 'energy_concentration',
+#                 'sustained_fraction', 'vocal_balance',
+#                 'h2l', 'burst', 'g_mean', 'g_std']
